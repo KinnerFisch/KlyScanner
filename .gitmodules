@@ -1,0 +1,9 @@
+[submodule "KlyLogger"]
+	path = KlyLogger
+	url = https://github.com/KinnerFisch/KlyLogger.git
+[submodule "replxx"]
+	path = replxx
+	url = https://github.com/AmokHuginnsson/replxx.git
+[submodule "brigadier-cpp"]
+	path = brigadier-cpp
+	url = https://github.com/KinnerFisch/brigadier-cpp.git
