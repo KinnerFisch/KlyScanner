@@ -29,6 +29,13 @@
 #include "KlyScanner.hpp"
 #include <KlyLogger.hpp>
 
+#include <cstdlib>
+#include <mutex>
+#include <stdexcept>
+#include <thread>
+#include <typeinfo>
+#include <utility>
+
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -37,16 +44,122 @@ namespace {
 	class Runtime {
 		replxx::Replxx m_replxx;
 		brigadier::CommandDispatcher<void *> m_dispatcher;
+		std::mutex m_callback_mutex;
+		std::mutex m_start_mutex;
+		std::function<void(const std::wstring &)> m_syntax_exception_callback;
+		std::function<void(const std::wstring &, const std::wstring &)> m_exception_callback;
+		std::function<void()> m_before_execute_callback;
+		std::function<void()> m_after_execute_callback;
+		std::once_flag m_start_once;
+		std::once_flag m_join_once;
+		std::thread::id m_worker_id;
+		std::thread m_worker;
+
+	public:
+		void start() {
+			std::call_once(m_start_once, [this] {
+				std::lock_guard lock(m_start_mutex);
+				m_worker = std::thread([this] {
+					{
+						// Do not enter run() until start() has recorded the worker ID.
+						std::lock_guard ready(m_start_mutex);
+					}
+					run();
+				});
+				m_worker_id = m_worker.get_id();
+			});
+		}
+
+		void set_syntax_exception_callback(const std::function<void(const std::wstring &)> &callback) {
+			{
+				std::lock_guard lock(m_callback_mutex);
+				m_syntax_exception_callback = callback;
+			}
+			start();
+		}
+
+		void set_exception_callback(const std::function<void(const std::wstring &, const std::wstring &)> &callback) {
+			{
+				std::lock_guard lock(m_callback_mutex);
+				m_exception_callback = callback;
+			}
+			start();
+		}
+
+		void set_before_execute_callback(const std::function<void()> &callback) {
+			{
+				std::lock_guard lock(m_callback_mutex);
+				m_before_execute_callback = callback;
+			}
+			start();
+		}
+
+		void set_after_execute_callback(const std::function<void()> &callback) {
+			{
+				std::lock_guard lock(m_callback_mutex);
+				m_after_execute_callback = callback;
+			}
+			start();
+		}
+
+		void join() {
+			start();
+			if (std::this_thread::get_id() == m_worker_id) return;
+			std::call_once(m_join_once, [this] { m_worker.join(); });
+		}
+
+	private:
+		void before_execute() {
+			std::function<void()> callback;
+			{
+				std::lock_guard lock(m_callback_mutex);
+				callback = m_before_execute_callback;
+			}
+			if (callback) callback();
+		}
+
+		void after_execute() {
+			std::function<void()> callback;
+			{
+				std::lock_guard lock(m_callback_mutex);
+				callback = m_after_execute_callback;
+			}
+			if (callback) callback();
+		}
+
+		void report(const brigadier::CommandSyntaxException &exception) {
+			std::function<void(const std::wstring &)> callback;
+			KlyLogger().info(exception.What());
+			{
+				std::lock_guard lock(m_callback_mutex);
+				callback = m_syntax_exception_callback;
+			}
+			if (callback) callback(exception.What());
+			KlyLogger().info(static_cast<bool>(callback));
+		}
+
+		void report(const std::exception &exception) {
+			std::function<void(const std::wstring &, const std::wstring &)> callback;
+			{
+				std::lock_guard lock(m_callback_mutex);
+				callback = m_exception_callback;
+			}
+			if (callback)
+				callback(KlyLogger::StringConverter::to_wstring(typeid(exception).name()), KlyLogger::StringConverter::to_wstring(exception.what()));
+		}
 
 		void run() {
 			m_replxx.set_ignore_case(false);
 			m_replxx.set_word_break_characters(" ");
+
+			m_dispatcher.Register(L"exit").Executes([](auto&) { std::exit(0); return 1; });
+
+			// Tab auto-completion.
 			m_replxx.set_completion_callback([this](const auto &input, auto &) {
 				std::vector<replxx::Replxx::Completion> results;
 				bool cancel;
 				for (auto parse_results =
-					m_dispatcher.Parse(KlyLogger::StringConverter::to_wstring(input)
-						.substr(0, m_replxx.get_state().cursor_position()), nullptr);
+					m_dispatcher.Parse(KlyLogger::StringConverter::to_wstring(input).substr(0, m_replxx.get_state().cursor_position()), nullptr);
 					const auto &suggestion : m_dispatcher.GetCompletionSuggestions(parse_results, &cancel).get().GetList()) {
 					const std::string &raw = KlyLogger::StringConverter::to_string(suggestion.GetText());
 					const size_t sep = raw.find_last_of(' ');
@@ -54,6 +167,8 @@ namespace {
 				}
 				return results;
 			});
+
+			// Red text autocomplete suggestions for input content.
 			m_replxx.set_hint_callback([this](const auto &input, auto &, auto &color) {
 				if (input.empty()) return std::vector<std::string>{};
 				bool cancel;
@@ -68,6 +183,8 @@ namespace {
 				}
 				return std::vector<std::string>{};
 			});
+
+			// Minecraft-style color rendering of entered text.
 			m_replxx.set_highlighter_callback([this](const auto &raw_input, replxx::Replxx::colors_t &colors) {
 				constexpr replxx::Replxx::Color presetColors[] = { replxx::Replxx::Color::CYAN, replxx::Replxx::Color::BROWN,
 					replxx::Replxx::Color::GREEN, replxx::Replxx::Color::MAGENTA, replxx::Replxx::Color::BLUE };
@@ -101,6 +218,64 @@ namespace {
 					if (complete.empty() && pos < len) for (int i = pos; i < len; ++i) colors[i] = replxx::Replxx::Color::RED;
 				}
 			});
+
+			while (true) {
+				try {
+					KlyLogger::wait();
+					const char *input = m_replxx.input("> ");
+					if (!input) return;
+					if (input[0]) {
+						m_replxx.history_add(input);
+						before_execute();
+						try {
+							m_dispatcher.Execute(KlyLogger::StringConverter::to_wstring(input), nullptr);
+						} catch (...) {
+							// Preserve the command exception even if the after callback fails.
+							try { after_execute(); } catch (...) {}
+							throw;
+						}
+						after_execute();
+					}
+				} catch (const brigadier::CommandSyntaxException &exception) {
+					try {
+						report(exception);
+					} catch (const std::exception &callback_exception) {
+						try {
+							report(callback_exception);
+						} catch (...) {}
+					} catch (...) {}
+				} catch (const std::exception &exception) {
+					try {
+						report(exception);
+					} catch (...) {}
+				}
+			}
 		}
 	};
+
+	// Keep the runtime alive through std::exit(), including when called by its worker.
+	Runtime& runtime() {
+		static Runtime* instance = new Runtime;
+		return *instance;
+	}
 }
+
+void KlyScanner::start() { runtime().start(); }
+
+void KlyScanner::set_syntax_exception_callback(const std::function<void(const std::wstring &)> &callback) {
+	runtime().set_syntax_exception_callback(callback);
+}
+
+void KlyScanner::set_exception_callback(const std::function<void(const std::wstring &, const std::wstring &)> &callback) {
+	runtime().set_exception_callback(callback);
+}
+
+void KlyScanner::set_before_execute_callback(const std::function<void()> &callback) {
+	runtime().set_before_execute_callback(callback);
+}
+
+void KlyScanner::set_after_execute_callback(const std::function<void()> &callback) {
+	runtime().set_after_execute_callback(callback);
+}
+
+void KlyScanner::join() { runtime().join(); }

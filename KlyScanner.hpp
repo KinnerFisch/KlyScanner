@@ -31,12 +31,22 @@
 #ifndef KLY_SCANNER_INCLUDED
 #define KLY_SCANNER_INCLUDED
 
+#include <functional>
+#include <string>
+
 #include <brigadier.hpp>
 #include <replxx.hxx>
 
 // KlyScanner: A console command-line input feature modeled after PaperConsole, powered by replxx and brigadier-cpp.
 class KlyScanner {
-	
+public:
+	static void start();
+	static void set_syntax_exception_callback(const std::function<void(const std::wstring &)> &callback);
+	static void set_exception_callback(const std::function<void(const std::wstring &, const std::wstring &)> &callback);
+	static void set_before_execute_callback(const std::function<void()> &callback);
+	static void set_after_execute_callback(const std::function<void()> &callback);
+	// Wait until the scanner worker finishes (e.g. stdin reaches EOF).
+	static void join();
 };
 
 #endif
