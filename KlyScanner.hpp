@@ -31,22 +31,58 @@
 #ifndef KLY_SCANNER_INCLUDED
 #define KLY_SCANNER_INCLUDED
 
-#include <functional>
-#include <string>
-
+#include <KlyLogger.hpp>
 #include <brigadier.hpp>
-#include <replxx.hxx>
 
 // KlyScanner: A console command-line input feature modeled after PaperConsole, powered by replxx and brigadier-cpp.
 class KlyScanner {
 public:
+	// Start the background input worker once without waiting for it to finish.
 	static void start();
+	// Register a worker callback receiving CommandSyntaxException::What(); an empty function clears it.
 	static void set_syntax_exception_callback(const std::function<void(const std::wstring &)> &callback);
+	// Register a worker callback receiving the exception type and message converted to wide strings.
 	static void set_exception_callback(const std::function<void(const std::wstring &, const std::wstring &)> &callback);
+	// Register a callback to run before each non-empty command entered through the input worker.
 	static void set_before_execute_callback(const std::function<void()> &callback);
+	// Register a callback to run after each entered command, including failures but not process exit.
 	static void set_after_execute_callback(const std::function<void()> &callback);
-	// Wait until the scanner worker finishes (e.g. stdin reaches EOF).
+	// Register a callback receiving the original and plain text after global log output.
+	static void set_after_log_callback(const std::function<void(const std::wstring &, const std::wstring &)> &callback);
+	// Start the worker and wait until it finishes (e.g. on EOF); return immediately on the worker itself.
 	static void join();
+	// Register or retrieve a literal command builder sharing ownership of its node.
+	// Dispatcher operations below are unsynchronized; do not mutate the tree while another thread uses it.
+	static brigadier::Literal<void *> register_command(const std::wstring &name);
+	// Execute a command directly with a null source; worker callbacks are not invoked and exceptions propagate.
+	static int execute_command(const std::wstring &command);
+	// Parse and execute from the reader's current position with a null source.
+	static int execute_command(brigadier::StringReader &command);
+	// Execute an existing parse result without parsing the input again.
+	static int execute_command(brigadier::ParseResults<void *> &parse);
+	// Report ambiguous command paths to the supplied consumer.
+	static void find_ambiguities_commands(const brigadier::AmbiguityConsumer<void *> &consumer);
+	// Borrow a node without copying it, or return nullopt when the path does not exist.
+	// The reference does not own the node and must not outlive its membership in the command tree.
+	static std::optional<std::reference_wrapper<brigadier::CommandNode<void *>>> find_node(const std::vector<std::wstring> &path);
+	// Build usage strings under a node, optionally restricting them to commands accessible to the null source.
+	static std::vector<std::wstring> get_all_command_usages(brigadier::CommandNode<void *> *node, bool restricted);
+	// Request completion suggestions at the end of the parsed input; preserve inputs required by Brigadier until completion.
+	static std::future<brigadier::Suggestions> get_completion_suggestions(brigadier::ParseResults<void *> &parse, bool *cancel = nullptr);
+	// Request completion suggestions at a specific cursor position.
+	static std::future<brigadier::Suggestions> get_completion_suggestions(brigadier::ParseResults<void *> &parse, int cursor, bool *cancel = nullptr);
+	// Build the path from the command root to a target node.
+	static std::vector<std::wstring> get_node_path(brigadier::CommandNode<void *> *target);
+	// Borrow the process-wide command root without copying the node or its shared ownership handle.
+	static brigadier::RootCommandNode<void *> &get_root_command_node();
+	// Build compact usage strings keyed by non-owning pointers to child nodes.
+	static std::map<brigadier::CommandNode<void *> *, std::wstring> get_smart_command_usage(brigadier::CommandNode<void *> *node);
+	// Parse a command with a null source without executing it.
+	static brigadier::ParseResults<void *> parse_command(const std::wstring &command);
+	// Parse from the reader's current position with a null source.
+	static brigadier::ParseResults<void *> parse_command(brigadier::StringReader &command);
+	// Register Brigadier's per-command result consumer, receiving context, success, and result.
+	static void set_brigadier_consumer(const brigadier::ResultConsumer<void *> &consumer);
 };
 
 #endif

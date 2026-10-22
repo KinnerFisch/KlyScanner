@@ -27,35 +27,40 @@
  */
 
 #include "KlyScanner.hpp"
-#include <KlyLogger.hpp>
-
-#include <cstdlib>
-#include <mutex>
-#include <stdexcept>
-#include <thread>
-#include <typeinfo>
-#include <utility>
+#include <replxx.hxx>
 
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 
 namespace {
+	// User hook forwarded by the global logger callback installed by start().
+	std::function<void(const std::wstring &, const std::wstring &)> g_after_log_callback;
+
+	// Process-wide command tree, input editor, callback storage, and background input worker.
 	class Runtime {
-		replxx::Replxx m_replxx;
+	public:
+		// Shared by the input worker and the public dispatcher forwarding functions.
 		brigadier::CommandDispatcher<void *> m_dispatcher;
+
+	private:
+		// Input editor and locks for callback registration and worker startup.
+		replxx::Replxx m_replxx;
 		std::mutex m_callback_mutex;
 		std::mutex m_start_mutex;
+		// Callbacks are copied under the callback lock and invoked after releasing it.
 		std::function<void(const std::wstring &)> m_syntax_exception_callback;
 		std::function<void(const std::wstring &, const std::wstring &)> m_exception_callback;
 		std::function<void()> m_before_execute_callback;
 		std::function<void()> m_after_execute_callback;
+		// Coordinate one worker creation and one join across concurrent callers.
 		std::once_flag m_start_once;
 		std::once_flag m_join_once;
 		std::thread::id m_worker_id;
 		std::thread m_worker;
 
 	public:
+		// Start the input worker once and install the global log-to-prompt integration.
 		void start() {
 			std::call_once(m_start_once, [this] {
 				std::lock_guard lock(m_start_mutex);
@@ -68,40 +73,38 @@ namespace {
 				});
 				m_worker_id = m_worker.get_id();
 			});
+			KlyLogger::set_global_after_log_callback([this](const std::wstring &origin, const std::wstring &plain) {
+				m_replxx.print("");
+				if (g_after_log_callback) g_after_log_callback(origin, plain);
+			});
 		}
 
 		void set_syntax_exception_callback(const std::function<void(const std::wstring &)> &callback) {
-			{
-				std::lock_guard lock(m_callback_mutex);
-				m_syntax_exception_callback = callback;
-			}
-			start();
+			std::lock_guard lock(m_callback_mutex);
+			m_syntax_exception_callback = callback;
 		}
 
 		void set_exception_callback(const std::function<void(const std::wstring &, const std::wstring &)> &callback) {
-			{
-				std::lock_guard lock(m_callback_mutex);
-				m_exception_callback = callback;
-			}
-			start();
+			std::lock_guard lock(m_callback_mutex);
+			m_exception_callback = callback;
 		}
 
 		void set_before_execute_callback(const std::function<void()> &callback) {
-			{
-				std::lock_guard lock(m_callback_mutex);
-				m_before_execute_callback = callback;
-			}
-			start();
+			std::lock_guard lock(m_callback_mutex);
+			m_before_execute_callback = callback;
 		}
 
 		void set_after_execute_callback(const std::function<void()> &callback) {
-			{
-				std::lock_guard lock(m_callback_mutex);
-				m_after_execute_callback = callback;
-			}
-			start();
+			std::lock_guard lock(m_callback_mutex);
+			m_after_execute_callback = callback;
 		}
 
+		void set_after_log_callback(const std::function<void(const std::wstring &, const std::wstring &)> &callback) {
+			std::lock_guard lock(m_callback_mutex);
+			g_after_log_callback = callback;
+		}
+
+		// Wait for worker completion without joining the same thread more than once.
 		void join() {
 			start();
 			if (std::this_thread::get_id() == m_worker_id) return;
@@ -109,6 +112,7 @@ namespace {
 		}
 
 	private:
+		// Invoke a snapshot so user code can register callbacks without holding this lock.
 		void before_execute() {
 			std::function<void()> callback;
 			{
@@ -118,6 +122,7 @@ namespace {
 			if (callback) callback();
 		}
 
+		// Invoke the current after-execute callback outside the callback lock.
 		void after_execute() {
 			std::function<void()> callback;
 			{
@@ -127,17 +132,17 @@ namespace {
 			if (callback) callback();
 		}
 
+		// Forward the syntax error's existing wide-string message.
 		void report(const brigadier::CommandSyntaxException &exception) {
 			std::function<void(const std::wstring &)> callback;
-			KlyLogger().info(exception.What());
 			{
 				std::lock_guard lock(m_callback_mutex);
 				callback = m_syntax_exception_callback;
 			}
 			if (callback) callback(exception.What());
-			KlyLogger().info(static_cast<bool>(callback));
 		}
 
+		// Convert the dynamic exception type and message with the logger's string converter.
 		void report(const std::exception &exception) {
 			std::function<void(const std::wstring &, const std::wstring &)> callback;
 			{
@@ -148,11 +153,10 @@ namespace {
 				callback(KlyLogger::StringConverter::to_wstring(typeid(exception).name()), KlyLogger::StringConverter::to_wstring(exception.what()));
 		}
 
+		// Configure editing callbacks, then process entered commands until input ends.
 		void run() {
 			m_replxx.set_ignore_case(false);
 			m_replxx.set_word_break_characters(" ");
-
-			m_dispatcher.Register(L"exit").Executes([](auto&) { std::exit(0); return 1; });
 
 			// Tab auto-completion.
 			m_replxx.set_completion_callback([this](const auto &input, auto &) {
@@ -173,7 +177,7 @@ namespace {
 				if (input.empty()) return std::vector<std::string>{};
 				bool cancel;
 				auto results = m_dispatcher.Parse(KlyLogger::StringConverter::to_wstring(input), nullptr);
-				// I don't know what the principle is, anyway, without this line this function just stops working outright.
+				// Preserve the existing preliminary suggestion request before retrieving hints.
 				m_dispatcher.GetCompletionSuggestions(results, &cancel);
 				for (const auto &suggestion : m_dispatcher.GetCompletionSuggestions(results, &cancel).get().GetList()) {
 					const auto &raw = KlyLogger::StringConverter::to_string(suggestion.GetText());
@@ -219,6 +223,7 @@ namespace {
 				}
 			});
 
+			// Drain pending logs before prompting; callback failures must not replace command errors.
 			while (true) {
 				try {
 					KlyLogger::wait();
@@ -226,15 +231,21 @@ namespace {
 					if (!input) return;
 					if (input[0]) {
 						m_replxx.history_add(input);
-						before_execute();
+						try {
+							before_execute();
+						} catch (...) {}
 						try {
 							m_dispatcher.Execute(KlyLogger::StringConverter::to_wstring(input), nullptr);
 						} catch (...) {
 							// Preserve the command exception even if the after callback fails.
-							try { after_execute(); } catch (...) {}
+							try {
+								after_execute();
+							} catch (...) {}
 							throw;
 						}
-						after_execute();
+						try {
+							after_execute();
+						} catch (...) {}
 					}
 				} catch (const brigadier::CommandSyntaxException &exception) {
 					try {
@@ -255,8 +266,8 @@ namespace {
 
 	// Keep the runtime alive through std::exit(), including when called by its worker.
 	Runtime& runtime() {
-		static Runtime* instance = new Runtime;
-		return *instance;
+		static Runtime runtime;
+		return runtime;
 	}
 }
 
@@ -278,4 +289,80 @@ void KlyScanner::set_after_execute_callback(const std::function<void()> &callbac
 	runtime().set_after_execute_callback(callback);
 }
 
+void KlyScanner::set_after_log_callback(const std::function<void(const std::wstring &, const std::wstring &)> &callback) {
+	runtime().set_after_log_callback(callback);
+}
+
 void KlyScanner::join() { runtime().join(); }
+
+brigadier::Literal<void *> KlyScanner::register_command(const std::wstring &name) {
+	brigadier::Literal<void *>::node_type node_builder(name);
+	auto &root = get_root_command_node();
+	const auto arg = root.GetChildren().find(name);
+	if (arg == root.GetChildren().end()) {
+		auto new_node = std::make_shared<brigadier::Literal<void *>::node_type>(std::move(node_builder));
+		root.AddChild(new_node);
+		return { std::move(new_node) };
+	}
+	auto &arg_ptr = arg->second;
+	if (arg_ptr && node_builder.GetNodeType() != arg_ptr->GetNodeType()) throw std::runtime_error("Node type (literal/argument) mismatch!");
+	return { std::static_pointer_cast<brigadier::Literal<void *>::node_type>(arg_ptr) };
+}
+
+int KlyScanner::execute_command(const std::wstring &command) {
+	return runtime().m_dispatcher.Execute(command, nullptr);
+}
+
+int KlyScanner::execute_command(brigadier::StringReader &command) {
+	return runtime().m_dispatcher.Execute(command, nullptr);
+}
+
+int KlyScanner::execute_command(brigadier::ParseResults<void *> &parse) {
+	return runtime().m_dispatcher.Execute(parse);
+}
+
+void KlyScanner::find_ambiguities_commands(const brigadier::AmbiguityConsumer<void *> &consumer) {
+	runtime().m_dispatcher.FindAmbiguities(consumer);
+}
+
+std::optional<std::reference_wrapper<brigadier::CommandNode<void *>>> KlyScanner::find_node(const std::vector<std::wstring> &path) {
+	if (auto *node = runtime().m_dispatcher.FindNode(path)) return std::ref(*node);
+	return std::nullopt;
+}
+
+std::vector<std::wstring> KlyScanner::get_all_command_usages(brigadier::CommandNode<void *> *node, bool restricted) {
+	return runtime().m_dispatcher.GetAllUsage(node, nullptr, restricted);
+}
+
+std::future<brigadier::Suggestions> KlyScanner::get_completion_suggestions(brigadier::ParseResults<void *> &parse, bool *cancel) {
+	return runtime().m_dispatcher.GetCompletionSuggestions(parse, cancel);
+}
+
+std::future<brigadier::Suggestions> KlyScanner::get_completion_suggestions(brigadier::ParseResults<void *> &parse, int cursor, bool *cancel) {
+	return runtime().m_dispatcher.GetCompletionSuggestions(parse, cursor, cancel);
+}
+
+std::vector<std::wstring> KlyScanner::get_node_path(brigadier::CommandNode<void *> *target) {
+	return runtime().m_dispatcher.GetPath(target);
+}
+
+brigadier::RootCommandNode<void *> &KlyScanner::get_root_command_node() {
+	// The dispatcher retains ownership after this temporary shared_ptr is released.
+	return *runtime().m_dispatcher.GetRoot();
+}
+
+std::map<brigadier::CommandNode<void *> *, std::wstring> KlyScanner::get_smart_command_usage(brigadier::CommandNode<void *> *node) {
+	return runtime().m_dispatcher.GetSmartUsage(node, nullptr);
+}
+
+brigadier::ParseResults<void *> KlyScanner::parse_command(const std::wstring &command) {
+	return runtime().m_dispatcher.Parse(command, nullptr);
+}
+
+brigadier::ParseResults<void *> KlyScanner::parse_command(brigadier::StringReader &command) {
+	return runtime().m_dispatcher.Parse(command, nullptr);
+}
+
+void KlyScanner::set_brigadier_consumer(const brigadier::ResultConsumer<void *> &consumer) {
+	runtime().m_dispatcher.SetConsumer(consumer);
+}
