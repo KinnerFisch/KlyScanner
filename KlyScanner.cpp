@@ -28,24 +28,53 @@
 
 #include "KlyScanner.hpp"
 #include <replxx.hxx>
+#include <cstdarg>
 
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 
 namespace {
-	// User hook forwarded by the global logger callback installed by start().
-	std::function<void(const std::wstring &, const std::wstring &)> g_after_log_callback;
+	// Translate between Brigadier's wide-string offsets and replxx's Unicode code points.
+	bool surrogate_pair(const std::wstring &text, const size_t index) {
+		if constexpr (sizeof(wchar_t) != 2) return false;
+		return index + 1 < text.size() && text[index] >= 0xD800 && text[index] <= 0xDBFF && text[index + 1] >= 0xDC00 && text[index + 1] <= 0xDFFF;
+	}
+
+	size_t wide_offset(const std::wstring &text, const int code_points) {
+		size_t offset = 0;
+		for (int i = 0; i < code_points && offset < text.size(); ++i) offset += surrogate_pair(text, offset) ? 2 : 1;
+		return offset;
+	}
+
+	// Reuse storage only when UTF-16 offsets differ from code-point offsets.
+	// An empty map denotes identity mapping and does not allocate for BMP-only input.
+	void color_offsets(const std::wstring &text, std::vector<size_t> &offsets) {
+		offsets.clear();
+		if constexpr (sizeof(wchar_t) != 2) return;
+		size_t first_pair = 0;
+		while (first_pair < text.size() && !surrogate_pair(text, first_pair)) ++first_pair;
+		if (first_pair == text.size()) return;
+		offsets.resize(text.size() + 1);
+		size_t point = 0;
+		for (size_t i = 0; i < text.size(); ++point) {
+			const bool pair = surrogate_pair(text, i);
+			offsets[i++] = point;
+			if (pair) offsets[i++] = point;
+		}
+		offsets.back() = point;
+	}
 
 	// Process-wide command tree, input editor, callback storage, and background input worker.
 	class Runtime {
 	public:
+		replxx::Replxx m_replxx;
 		// Shared by the input worker and the public dispatcher forwarding functions.
 		brigadier::CommandDispatcher<void *> m_dispatcher;
 
 	private:
-		// Input editor and locks for callback registration and worker startup.
-		replxx::Replxx m_replxx;
+		// Used only by the input worker; capacity survives successive highlighter calls.
+		std::vector<size_t> m_color_offsets;
 		std::mutex m_callback_mutex;
 		std::mutex m_start_mutex;
 		// Callbacks are copied under the callback lock and invoked after releasing it.
@@ -53,6 +82,7 @@ namespace {
 		std::function<void(const std::wstring &, const std::wstring &)> m_exception_callback;
 		std::function<void()> m_before_execute_callback;
 		std::function<void()> m_after_execute_callback;
+		std::function<void(const std::wstring &, const std::wstring &)> m_after_log_callback;
 		// Coordinate one worker creation and one join across concurrent callers.
 		std::once_flag m_start_once;
 		std::once_flag m_join_once;
@@ -64,18 +94,30 @@ namespace {
 		void start() {
 			std::call_once(m_start_once, [this] {
 				std::lock_guard lock(m_start_mutex);
-				m_worker = std::thread([this] {
+				KlyLogger::set_global_after_log_callback([this](const std::wstring &origin, const std::wstring &plain) {
+					std::function<void(const std::wstring &, const std::wstring &)> callback;
 					{
-						// Do not enter run() until start() has recorded the worker ID.
-						std::lock_guard ready(m_start_mutex);
+						std::lock_guard _(m_callback_mutex);
+						callback = m_after_log_callback;
 					}
-					run();
+					m_replxx.print("");
+					if (callback) callback(origin, plain);
+				});
+				m_worker = std::thread([this]() noexcept {
+					// Include initialization in the exception boundary; reporting callbacks must not let a second exception escape the thread entry either.
+					try {
+						{
+							// Do not enter run() until start() has recorded the worker ID.
+							std::lock_guard ready(m_start_mutex);
+						}
+						run();
+					} catch (const std::exception &exception) {
+						try {
+							report(exception);
+						} catch (...) {}
+					} catch (...) {}
 				});
 				m_worker_id = m_worker.get_id();
-			});
-			KlyLogger::set_global_after_log_callback([this](const std::wstring &origin, const std::wstring &plain) {
-				m_replxx.print("");
-				if (g_after_log_callback) g_after_log_callback(origin, plain);
 			});
 		}
 
@@ -101,7 +143,7 @@ namespace {
 
 		void set_after_log_callback(const std::function<void(const std::wstring &, const std::wstring &)> &callback) {
 			std::lock_guard lock(m_callback_mutex);
-			g_after_log_callback = callback;
+			m_after_log_callback = callback;
 		}
 
 		// Wait for worker completion without joining the same thread more than once.
@@ -161,10 +203,12 @@ namespace {
 			// Tab auto-completion.
 			m_replxx.set_completion_callback([this](const auto &input, auto &) {
 				std::vector<replxx::Replxx::Completion> results;
-				bool cancel;
-				for (auto parse_results =
-					m_dispatcher.Parse(KlyLogger::StringConverter::to_wstring(input).substr(0, m_replxx.get_state().cursor_position()), nullptr);
-					const auto &suggestion : m_dispatcher.GetCompletionSuggestions(parse_results, &cancel).get().GetList()) {
+				const auto text = KlyLogger::StringConverter::to_wstring(input);
+				auto parse_results = m_dispatcher.Parse(text.substr(0, wide_offset(text, m_replxx.get_state().cursor_position())),
+					nullptr);
+				const auto suggestions = m_dispatcher.GetCompletionSuggestions(parse_results).get();
+				results.reserve(suggestions.GetList().size());
+				for (const auto &suggestion : suggestions.GetList()) {
 					const std::string &raw = KlyLogger::StringConverter::to_string(suggestion.GetText());
 					const size_t sep = raw.find_last_of(' ');
 					results.emplace_back(raw.substr(sep == std::string::npos ? 0 : sep + 1));
@@ -175,11 +219,8 @@ namespace {
 			// Red text autocomplete suggestions for input content.
 			m_replxx.set_hint_callback([this](const auto &input, auto &, auto &color) {
 				if (input.empty()) return std::vector<std::string>{};
-				bool cancel;
 				auto results = m_dispatcher.Parse(KlyLogger::StringConverter::to_wstring(input), nullptr);
-				// Preserve the existing preliminary suggestion request before retrieving hints.
-				m_dispatcher.GetCompletionSuggestions(results, &cancel);
-				for (const auto &suggestion : m_dispatcher.GetCompletionSuggestions(results, &cancel).get().GetList()) {
+				for (const auto suggestions = m_dispatcher.GetCompletionSuggestions(results).get(); const auto &suggestion : suggestions.GetList()) {
 					const auto &raw = KlyLogger::StringConverter::to_string(suggestion.GetText());
 					const size_t sep = raw.find_last_of(' ');
 					color = replxx::Replxx::Color::RED;
@@ -193,33 +234,37 @@ namespace {
 				constexpr replxx::Replxx::Color presetColors[] = { replxx::Replxx::Color::CYAN, replxx::Replxx::Color::BROWN,
 					replxx::Replxx::Color::GREEN, replxx::Replxx::Color::MAGENTA, replxx::Replxx::Color::BLUE };
 				const std::wstring input = KlyLogger::StringConverter::to_wstring(raw_input);
+				color_offsets(input, m_color_offsets);
+				const auto paint = [&](const int begin, const int end, const replxx::Replxx::Color color) {
+					for (int i = std::max(begin, 0); i < std::min(end, static_cast<int>(input.size())); ++i)
+						if (const size_t offset = m_color_offsets.empty() ? static_cast<size_t>(i) : m_color_offsets[i]; offset < colors.size()) colors[offset] = color;
+				};
 				auto results = m_dispatcher.Parse(input, nullptr);
 				int pos = 0, style = -1;
 				const int len = static_cast<int>(input.length());
-				for (auto node : results.GetContext().GetLastChild()->GetNodes()) {
+				for (const auto &node : results.GetContext().GetLastChild()->GetNodes()) {
 					if (const int start = node.GetRange().GetStart(); start >= len) break;
 					const int end = std::min(node.GetRange().GetEnd(), len);
 					if (node.GetNode()->GetNodeType() != brigadier::CommandNodeType::LiteralCommandNode) {
 						if (++style > 4) style = 0;
-						for (int i = pos; i < end; ++i) colors[i] = presetColors[style];
+						paint(pos, end, presetColors[style]);
 					}
 					pos = end;
 				}
 				if (len > 0) {
-					bool cancel;
 					const size_t idx = input.find_last_of(L' ');
-					const auto last = input.substr(idx == std::wstring::npos ? 0 : idx + 1);
-					std::wstring complete;
-					for (const auto &suggestion : m_dispatcher.GetCompletionSuggestions(results, &cancel).get().GetList()) {
-						std::wstring s = suggestion.GetText();
+					const auto last = std::wstring_view(input).substr(idx == std::wstring::npos ? 0 : idx + 1);
+					bool complete = false;
+					for (const auto suggestions = m_dispatcher.GetCompletionSuggestions(results).get(); const auto &suggestion : suggestions.GetList()) {
+						std::wstring_view s = suggestion.GetText();
 						const size_t index = s.find_last_of(L' ');
 						s = s.substr(index == std::wstring::npos ? 0 : index + 1);
 						if (s.starts_with(last)) {
-							complete = s;
+							complete = !s.empty();
 							break;
 						}
 					}
-					if (complete.empty() && pos < len) for (int i = pos; i < len; ++i) colors[i] = replxx::Replxx::Color::RED;
+					if (!complete && pos < len) paint(pos, len, replxx::Replxx::Color::RED);
 				}
 			});
 
@@ -228,7 +273,10 @@ namespace {
 				try {
 					KlyLogger::wait();
 					const char *input = m_replxx.input("> ");
-					if (!input) return;
+					if (!input) {
+						if (errno == EAGAIN) continue; // Ctrl-C aborts this line, not the worker.
+						return;
+					}
 					if (input[0]) {
 						m_replxx.history_add(input);
 						try {
@@ -265,9 +313,11 @@ namespace {
 	};
 
 	// Keep the runtime alive through std::exit(), including when called by its worker.
-	Runtime& runtime() {
-		static Runtime runtime;
-		return runtime;
+	Runtime &runtime() {
+		// Intentionally process-lived: exit() may run on the worker itself, so a
+		// static destructor cannot safely join it or destroy its active objects.
+		static auto* instance = new Runtime;
+		return *instance;
 	}
 }
 
@@ -365,4 +415,26 @@ brigadier::ParseResults<void *> KlyScanner::parse_command(brigadier::StringReade
 
 void KlyScanner::set_brigadier_consumer(const brigadier::ResultConsumer<void *> &consumer) {
 	runtime().m_dispatcher.SetConsumer(consumer);
+}
+
+void KlyScanner::print(const char *format, ...) {
+	if (!format) return;
+	// replxx exposes no va_list overload. Format as Replxx::print does, then use
+	// write() to preserve the length and avoid interpreting '%' a second time.
+	std::va_list args;
+	va_start(args, format);
+	const int length = std::vsnprintf(nullptr, 0, format, args);
+	va_end(args);
+	if (length < 0) return;
+	std::vector<char> buffer(static_cast<size_t>(length) + 1);
+	va_start(args, format);
+	const int written = std::vsnprintf(buffer.data(), buffer.size(), format, args);
+	va_end(args);
+	if (written < 0 || written > length) return;
+	runtime().m_replxx.write(buffer.data(), written);
+}
+
+void KlyScanner::print(const std::wstring &text) {
+	const auto utf8 = KlyLogger::StringConverter::to_string(text);
+	print("%s", utf8.c_str());
 }

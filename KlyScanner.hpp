@@ -38,6 +38,7 @@
 class KlyScanner {
 public:
 	// Start the background input worker once without waiting for it to finish.
+	// Configure callbacks and command builders before starting; other APIs do not start input implicitly.
 	static void start();
 	// Register a worker callback receiving CommandSyntaxException::What(); an empty function clears it.
 	static void set_syntax_exception_callback(const std::function<void(const std::wstring &)> &callback);
@@ -51,6 +52,11 @@ public:
 	static void set_after_log_callback(const std::function<void(const std::wstring &, const std::wstring &)> &callback);
 	// Start the worker and wait until it finishes (e.g. on EOF); return immediately on the worker itself.
 	static void join();
+	// Print using replxx's printf-style formatting; argument types must match the format.
+	// Does not start the input worker or append a newline. Use "%s" for untrusted text.
+	static void print(const char *format, ...);
+	// Convert wide text through KlyLogger and print it literally, including any '%' characters.
+	static void print(const std::wstring &text);
 	// Register or retrieve a literal command builder sharing ownership of its node.
 	// Dispatcher operations below are unsynchronized; do not mutate the tree while another thread uses it.
 	static brigadier::Literal<void *> register_command(const std::wstring &name);
@@ -73,7 +79,7 @@ public:
 	static std::future<brigadier::Suggestions> get_completion_suggestions(brigadier::ParseResults<void *> &parse, int cursor, bool *cancel = nullptr);
 	// Build the path from the command root to a target node.
 	static std::vector<std::wstring> get_node_path(brigadier::CommandNode<void *> *target);
-	// Borrow the process-wide command root without copying the node or its shared ownership handle.
+	// Borrow the process-wide command root without copying the node; the runtime is retained until process exit.
 	static brigadier::RootCommandNode<void *> &get_root_command_node();
 	// Build compact usage strings keyed by non-owning pointers to child nodes.
 	static std::map<brigadier::CommandNode<void *> *, std::wstring> get_smart_command_usage(brigadier::CommandNode<void *> *node);
