@@ -86,8 +86,9 @@ namespace {
 		// Coordinate one worker creation and one join across concurrent callers.
 		std::once_flag m_start_once;
 		std::once_flag m_join_once;
-		std::thread::id m_worker_id;
-		std::thread m_worker;
+		std::jthread::id m_worker_id;
+		// Input remains EOF-driven; jthread's stop request cannot interrupt replxx::input().
+		std::jthread m_worker;
 
 	public:
 		// Start the input worker once and install the global log-to-prompt integration.
@@ -103,7 +104,7 @@ namespace {
 					m_replxx.print("");
 					if (callback) callback(origin, plain);
 				});
-				m_worker = std::thread([this]() noexcept {
+				m_worker = std::jthread([this]() noexcept {
 					// Include initialization in the exception boundary; reporting callbacks must not let a second exception escape the thread entry either.
 					try {
 						{
