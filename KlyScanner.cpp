@@ -70,7 +70,7 @@ namespace {
 	public:
 		replxx::Replxx m_replxx;
 		// Shared by the input worker and the public dispatcher forwarding functions.
-		brigadier::CommandDispatcher<void *> m_dispatcher;
+		std::shared_ptr<KlyScanner::Dispatcher> m_dispatcher = std::make_shared<KlyScanner::Dispatcher>();
 
 	private:
 		// Used only by the input worker; capacity survives successive highlighter calls.
@@ -86,8 +86,9 @@ namespace {
 		// Coordinate one worker creation and one join across concurrent callers.
 		std::once_flag m_start_once;
 		std::once_flag m_join_once;
-		std::thread::id m_worker_id;
-		std::thread m_worker;
+		std::jthread::id m_worker_id;
+		// Input remains EOF-driven; jthread's stop request cannot interrupt replxx::input().
+		std::jthread m_worker;
 
 	public:
 		// Start the input worker once and install the global log-to-prompt integration.
@@ -103,7 +104,7 @@ namespace {
 					m_replxx.print("");
 					if (callback) callback(origin, plain);
 				});
-				m_worker = std::thread([this]() noexcept {
+				m_worker = std::jthread([this]() noexcept {
 					// Include initialization in the exception boundary; reporting callbacks must not let a second exception escape the thread entry either.
 					try {
 						{
@@ -204,9 +205,9 @@ namespace {
 			m_replxx.set_completion_callback([this](const auto &input, auto &) {
 				std::vector<replxx::Replxx::Completion> results;
 				const auto text = KlyLogger::StringConverter::to_wstring(input);
-				auto parse_results = m_dispatcher.Parse(text.substr(0, wide_offset(text, m_replxx.get_state().cursor_position())),
+				auto parse_results = m_dispatcher->Parse(text.substr(0, wide_offset(text, m_replxx.get_state().cursor_position())),
 					nullptr);
-				const auto suggestions = m_dispatcher.GetCompletionSuggestions(parse_results).get();
+				const auto suggestions = m_dispatcher->GetCompletionSuggestions(parse_results).get();
 				results.reserve(suggestions.GetList().size());
 				for (const auto &suggestion : suggestions.GetList()) {
 					const std::string &raw = KlyLogger::StringConverter::to_string(suggestion.GetText());
@@ -219,8 +220,8 @@ namespace {
 			// Red text autocomplete suggestions for input content.
 			m_replxx.set_hint_callback([this](const auto &input, auto &, auto &color) {
 				if (input.empty()) return std::vector<std::string>{};
-				auto results = m_dispatcher.Parse(KlyLogger::StringConverter::to_wstring(input), nullptr);
-				for (const auto suggestions = m_dispatcher.GetCompletionSuggestions(results).get(); const auto &suggestion : suggestions.GetList()) {
+				auto results = m_dispatcher->Parse(KlyLogger::StringConverter::to_wstring(input), nullptr);
+				for (const auto suggestions = m_dispatcher->GetCompletionSuggestions(results).get(); const auto &suggestion : suggestions.GetList()) {
 					const auto &raw = KlyLogger::StringConverter::to_string(suggestion.GetText());
 					const size_t sep = raw.find_last_of(' ');
 					color = replxx::Replxx::Color::RED;
@@ -239,7 +240,7 @@ namespace {
 					for (int i = std::max(begin, 0); i < std::min(end, static_cast<int>(input.size())); ++i)
 						if (const size_t offset = m_color_offsets.empty() ? static_cast<size_t>(i) : m_color_offsets[i]; offset < colors.size()) colors[offset] = color;
 				};
-				auto results = m_dispatcher.Parse(input, nullptr);
+				auto results = m_dispatcher->Parse(input, nullptr);
 				int pos = 0, style = -1;
 				const int len = static_cast<int>(input.length());
 				for (const auto &node : results.GetContext().GetLastChild()->GetNodes()) {
@@ -255,7 +256,7 @@ namespace {
 					const size_t idx = input.find_last_of(L' ');
 					const auto last = std::wstring_view(input).substr(idx == std::wstring::npos ? 0 : idx + 1);
 					bool complete = false;
-					for (const auto suggestions = m_dispatcher.GetCompletionSuggestions(results).get(); const auto &suggestion : suggestions.GetList()) {
+					for (const auto suggestions = m_dispatcher->GetCompletionSuggestions(results).get(); const auto &suggestion : suggestions.GetList()) {
 						std::wstring_view s = suggestion.GetText();
 						const size_t index = s.find_last_of(L' ');
 						s = s.substr(index == std::wstring::npos ? 0 : index + 1);
@@ -283,7 +284,7 @@ namespace {
 							before_execute();
 						} catch (...) {}
 						try {
-							m_dispatcher.Execute(KlyLogger::StringConverter::to_wstring(input), nullptr);
+							m_dispatcher->Execute(KlyLogger::StringConverter::to_wstring(input), nullptr);
 						} catch (...) {
 							// Preserve the command exception even if the after callback fails.
 							try {
@@ -345,6 +346,13 @@ void KlyScanner::set_after_log_callback(const std::function<void(const std::wstr
 
 void KlyScanner::join() { runtime().join(); }
 
+std::shared_ptr<KlyScanner::Dispatcher> KlyScanner::get_dispatcher() { return runtime().m_dispatcher; }
+
+void KlyScanner::set_dispatcher(std::shared_ptr<Dispatcher> dispatcher) {
+	if (!dispatcher) throw std::invalid_argument("dispatcher must not be null");
+	runtime().m_dispatcher = std::move(dispatcher);
+}
+
 brigadier::Literal<void *> KlyScanner::register_command(const std::wstring &name) {
 	brigadier::Literal<void *>::node_type node_builder(name);
 	auto &root = get_root_command_node();
@@ -360,61 +368,61 @@ brigadier::Literal<void *> KlyScanner::register_command(const std::wstring &name
 }
 
 int KlyScanner::execute_command(const std::wstring &command) {
-	return runtime().m_dispatcher.Execute(command, nullptr);
+	return runtime().m_dispatcher->Execute(command, nullptr);
 }
 
 int KlyScanner::execute_command(brigadier::StringReader &command) {
-	return runtime().m_dispatcher.Execute(command, nullptr);
+	return runtime().m_dispatcher->Execute(command, nullptr);
 }
 
 int KlyScanner::execute_command(brigadier::ParseResults<void *> &parse) {
-	return runtime().m_dispatcher.Execute(parse);
+	return runtime().m_dispatcher->Execute(parse);
 }
 
 void KlyScanner::find_ambiguities_commands(const brigadier::AmbiguityConsumer<void *> &consumer) {
-	runtime().m_dispatcher.FindAmbiguities(consumer);
+	runtime().m_dispatcher->FindAmbiguities(consumer);
 }
 
 std::optional<std::reference_wrapper<brigadier::CommandNode<void *>>> KlyScanner::find_node(const std::vector<std::wstring> &path) {
-	if (auto *node = runtime().m_dispatcher.FindNode(path)) return std::ref(*node);
+	if (auto *node = runtime().m_dispatcher->FindNode(path)) return std::ref(*node);
 	return std::nullopt;
 }
 
 std::vector<std::wstring> KlyScanner::get_all_command_usages(brigadier::CommandNode<void *> *node, bool restricted) {
-	return runtime().m_dispatcher.GetAllUsage(node, nullptr, restricted);
+	return runtime().m_dispatcher->GetAllUsage(node, nullptr, restricted);
 }
 
 std::future<brigadier::Suggestions> KlyScanner::get_completion_suggestions(brigadier::ParseResults<void *> &parse, bool *cancel) {
-	return runtime().m_dispatcher.GetCompletionSuggestions(parse, cancel);
+	return runtime().m_dispatcher->GetCompletionSuggestions(parse, cancel);
 }
 
 std::future<brigadier::Suggestions> KlyScanner::get_completion_suggestions(brigadier::ParseResults<void *> &parse, int cursor, bool *cancel) {
-	return runtime().m_dispatcher.GetCompletionSuggestions(parse, cursor, cancel);
+	return runtime().m_dispatcher->GetCompletionSuggestions(parse, cursor, cancel);
 }
 
 std::vector<std::wstring> KlyScanner::get_node_path(brigadier::CommandNode<void *> *target) {
-	return runtime().m_dispatcher.GetPath(target);
+	return runtime().m_dispatcher->GetPath(target);
 }
 
 brigadier::RootCommandNode<void *> &KlyScanner::get_root_command_node() {
 	// The dispatcher retains ownership after this temporary shared_ptr is released.
-	return *runtime().m_dispatcher.GetRoot();
+	return *runtime().m_dispatcher->GetRoot();
 }
 
 std::map<brigadier::CommandNode<void *> *, std::wstring> KlyScanner::get_smart_command_usage(brigadier::CommandNode<void *> *node) {
-	return runtime().m_dispatcher.GetSmartUsage(node, nullptr);
+	return runtime().m_dispatcher->GetSmartUsage(node, nullptr);
 }
 
 brigadier::ParseResults<void *> KlyScanner::parse_command(const std::wstring &command) {
-	return runtime().m_dispatcher.Parse(command, nullptr);
+	return runtime().m_dispatcher->Parse(command, nullptr);
 }
 
 brigadier::ParseResults<void *> KlyScanner::parse_command(brigadier::StringReader &command) {
-	return runtime().m_dispatcher.Parse(command, nullptr);
+	return runtime().m_dispatcher->Parse(command, nullptr);
 }
 
 void KlyScanner::set_brigadier_consumer(const brigadier::ResultConsumer<void *> &consumer) {
-	runtime().m_dispatcher.SetConsumer(consumer);
+	runtime().m_dispatcher->SetConsumer(consumer);
 }
 
 void KlyScanner::print(const char *format, ...) {

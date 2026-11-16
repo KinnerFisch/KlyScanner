@@ -103,6 +103,27 @@ Dispatcher wrappers operate directly on the shared command tree; they do not enq
 
 公开接口声明于 [`KlyScanner.hpp`](KlyScanner.hpp)。分发器封装直接访问共享命令树，不会把操作排入输入线程。
 
+### Dispatcher / 命令分发器
+
+```cpp
+auto original = KlyScanner::get_dispatcher();
+auto replacement = std::make_shared<KlyScanner::Dispatcher>();
+KlyScanner::set_dispatcher(replacement);
+// KlyScanner and the caller share ownership of replacement.
+```
+
+The dispatcher starts as an empty, non-null instance. `set_dispatcher` rejects null with
+`std::invalid_argument`. Replacing it changes the tree used by subsequent Scanner calls;
+it does not copy commands or callbacks from the previous dispatcher. Replacement and
+dispatcher access must be externally synchronized, including with the input worker.
+Keep the old shared pointer alive while using borrowed nodes, parse results, or pending
+suggestions from its tree, and use those objects with their originating dispatcher.
+
+默认 dispatcher 为空命令树且非空。`set_dispatcher` 对空指针抛出 `std::invalid_argument`；
+替换后 Scanner 使用新的命令树，不会复制旧命令或 consumer。替换和访问 dispatcher（包括输入线程）
+需要由调用方同步。使用旧树的借用节点、解析结果或未完成的补全时，应持有旧 shared_ptr，
+并将这些对象与其原来的 dispatcher 一起使用。
+
 ### Starting and waiting / 启动与等待
 
 ```cpp

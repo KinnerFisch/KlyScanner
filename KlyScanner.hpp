@@ -37,6 +37,11 @@
 // KlyScanner: A console command-line input feature modeled after PaperConsole, powered by replxx and brigadier-cpp.
 class KlyScanner {
 public:
+	using Dispatcher = brigadier::CommandDispatcher<void *>;
+	// Get or replace the dispatcher. Replacement rejects null and must not race with dispatcher use.
+	// Keep the old shared_ptr alive while using its borrowed nodes or parse results.
+	static std::shared_ptr<Dispatcher> get_dispatcher();
+	static void set_dispatcher(std::shared_ptr<Dispatcher> dispatcher);
 	// Start the background input worker once without waiting for it to finish.
 	// Configure callbacks and command builders before starting; other APIs do not start input implicitly.
 	static void start();
@@ -79,7 +84,7 @@ public:
 	static std::future<brigadier::Suggestions> get_completion_suggestions(brigadier::ParseResults<void *> &parse, int cursor, bool *cancel = nullptr);
 	// Build the path from the command root to a target node.
 	static std::vector<std::wstring> get_node_path(brigadier::CommandNode<void *> *target);
-	// Borrow the process-wide command root without copying the node; the runtime is retained until process exit.
+	// Borrow the current command root; retain its dispatcher while using the reference.
 	static brigadier::RootCommandNode<void *> &get_root_command_node();
 	// Build compact usage strings keyed by non-owning pointers to child nodes.
 	static std::map<brigadier::CommandNode<void *> *, std::wstring> get_smart_command_usage(brigadier::CommandNode<void *> *node);
