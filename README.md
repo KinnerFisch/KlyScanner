@@ -127,19 +127,22 @@ suggestions from its tree, and use those objects with their originating dispatch
 ### Starting and waiting / 启动与等待
 
 ```cpp
-KlyScanner::start(); // Start once without waiting / 只启动一次，不等待结束
-KlyScanner::join();  // Start if needed, then wait / 尚未启动时先启动，再等待
+KlyScanner::start(); // Start or resume without waiting / 启动或恢复，不等待
+KlyScanner::stop();  // Pause after the current input and command / 当前输入和命令结束后暂停
+KlyScanner::join();  // Start or resume, then wait / 启动或恢复后等待
 ```
 
 - Registering commands or callbacks does not start input implicitly.
-- Multiple `start()` calls do not create additional workers. Concurrent or repeated `join()` calls share one underlying thread join.
+- Multiple `start()` calls do not create additional workers. Concurrent `join()` calls can wait for the same worker.
 - Calling `join()` from the input worker returns immediately instead of waiting for itself.
-- EOF ends the worker; Ctrl-C aborts the current input line and resumes prompting. The worker cannot be restarted after it finishes.
-- There is no explicit `stop()` API. `join()` waits; it does not cancel a pending input read.
+- `stop()` requests a pause and returns immediately, including when called on the input worker. An input already in progress and its command finish normally; the worker then pauses before starting another input.
+- `start()` resumes a paused worker. `join()` also starts or resumes it, then waits for EOF or a subsequent completed stop. A blocked input can therefore delay a waiting `join()` indefinitely.
+- EOF ends the worker; Ctrl-C aborts the current input line and resumes prompting. A later `start()` or `join()` can create a worker again, although an EOF on stdin must be resolved by the application.
 
-注册命令或回调不会隐式启动输入。重复 `start()` 不会创建多个线程；多个线程同时或重复调用 `join()` 时，只进行一次底层 join。
-输入线程自己调用 `join()` 会立即返回。EOF 结束线程，Ctrl-C 取消当前输入行后继续提示；线程结束后不能重新启动。
-当前没有显式 `stop()` 接口，`join()` 只等待，不会取消正在阻塞的输入读取。
+注册命令或回调不会隐式启动输入。重复 `start()` 不会创建多个线程；多个线程可以同时等待同一个 worker。
+`stop()` 非阻塞，输入线程自身也可以调用。已开始的输入和对应命令会正常完成，之后在下一次输入前暂停；它不会中断阻塞的输入。
+`start()` 可恢复输入；`join()` 也会先启动或恢复，再等待 EOF 或之后的暂停完成，因此等待可能被阻塞的输入无限期延迟。输入线程调用 `join()` 会立即返回。
+EOF 结束线程；之后可再次调用 `start()` 或 `join()` 创建线程，但标准输入的 EOF 需要应用自行处理。Ctrl-C 取消当前输入行后继续提示。
 
 ### Console output / 控制台输出
 

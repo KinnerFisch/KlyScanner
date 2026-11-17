@@ -28,7 +28,9 @@
 
 #include "KlyScanner.hpp"
 #include <replxx.hxx>
+#include <condition_variable>
 #include <cstdarg>
+#include <thread>
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -77,24 +79,26 @@ namespace {
 		std::vector<size_t> m_color_offsets;
 		std::mutex m_callback_mutex;
 		std::mutex m_start_mutex;
+		std::condition_variable m_worker_changed;
 		// Callbacks are copied under the callback lock and invoked after releasing it.
 		std::function<void(const std::wstring &)> m_syntax_exception_callback;
 		std::function<void(const std::wstring &, const std::wstring &)> m_exception_callback;
 		std::function<void()> m_before_execute_callback;
 		std::function<void()> m_after_execute_callback;
 		std::function<void(const std::wstring &, const std::wstring &)> m_after_log_callback;
-		// Coordinate one worker creation and one join across concurrent callers.
-		std::once_flag m_start_once;
-		std::once_flag m_join_once;
+		// A stopped worker waits here after completing any input already in progress.
+		std::once_flag m_callback_once;
+		bool m_enabled = false;
+		bool m_running = false;
+		bool m_paused = false;
 		std::jthread::id m_worker_id;
 		// Input remains EOF-driven; jthread's stop request cannot interrupt replxx::input().
 		std::jthread m_worker;
 
 	public:
-		// Start the input worker once and install the global log-to-prompt integration.
+		// Start or resume the input worker and install the global log-to-prompt integration.
 		void start() {
-			std::call_once(m_start_once, [this] {
-				std::lock_guard lock(m_start_mutex);
+			std::call_once(m_callback_once, [this] {
 				KlyLogger::set_global_after_log_callback([this](const std::wstring &origin, const std::wstring &plain) {
 					std::function<void(const std::wstring &, const std::wstring &)> callback;
 					{
@@ -104,6 +108,11 @@ namespace {
 					m_replxx.print("");
 					if (callback) callback(origin, plain);
 				});
+			});
+			std::lock_guard lock(m_start_mutex);
+			m_enabled = true;
+			m_paused = false;
+			if (!m_running) {
 				m_worker = std::jthread([this]() noexcept {
 					// Include initialization in the exception boundary; reporting callbacks must not let a second exception escape the thread entry either.
 					try {
@@ -117,9 +126,22 @@ namespace {
 							report(exception);
 						} catch (...) {}
 					} catch (...) {}
+					{
+						std::lock_guard lock(m_start_mutex);
+						m_running = false;
+						m_worker_id = {};
+					}
+					m_worker_changed.notify_all();
 				});
 				m_worker_id = m_worker.get_id();
-			});
+				m_running = true;
+			}
+			m_worker_changed.notify_all();
+		}
+
+		void stop() {
+			std::lock_guard lock(m_start_mutex);
+			m_enabled = false;
 		}
 
 		void set_syntax_exception_callback(const std::function<void(const std::wstring &)> &callback) {
@@ -147,11 +169,15 @@ namespace {
 			m_after_log_callback = callback;
 		}
 
-		// Wait for worker completion without joining the same thread more than once.
+		// Wait for EOF or a completed stop; never wait from the input worker itself.
 		void join() {
+			{
+				std::lock_guard lock(m_start_mutex);
+				if (m_running && std::this_thread::get_id() == m_worker_id) return;
+			}
 			start();
-			if (std::this_thread::get_id() == m_worker_id) return;
-			std::call_once(m_join_once, [this] { m_worker.join(); });
+			std::unique_lock lock(m_start_mutex);
+			m_worker_changed.wait(lock, [this] { return !m_running || m_paused; });
 		}
 
 	private:
@@ -272,7 +298,19 @@ namespace {
 			// Drain pending logs before prompting; callback failures must not replace command errors.
 			while (true) {
 				try {
+					{
+						std::unique_lock lock(m_start_mutex);
+						if (!m_enabled) {
+							m_paused = true;
+							m_worker_changed.notify_all();
+							m_worker_changed.wait(lock, [this] { return m_enabled; });
+						}
+					}
 					KlyLogger::wait();
+					{
+						std::lock_guard lock(m_start_mutex);
+						if (!m_enabled) continue;
+					}
 					const char *input = m_replxx.input("> ");
 					if (!input) {
 						if (errno == EAGAIN) continue; // Ctrl-C aborts this line, not the worker.
@@ -323,6 +361,8 @@ namespace {
 }
 
 void KlyScanner::start() { runtime().start(); }
+
+void KlyScanner::stop() { runtime().stop(); }
 
 void KlyScanner::set_syntax_exception_callback(const std::function<void(const std::wstring &)> &callback) {
 	runtime().set_syntax_exception_callback(callback);

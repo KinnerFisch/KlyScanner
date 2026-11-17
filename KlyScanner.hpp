@@ -42,9 +42,12 @@ public:
 	// Keep the old shared_ptr alive while using its borrowed nodes or parse results.
 	static std::shared_ptr<Dispatcher> get_dispatcher();
 	static void set_dispatcher(std::shared_ptr<Dispatcher> dispatcher);
-	// Start the background input worker once without waiting for it to finish.
+	// Start or resume the background input worker without waiting for input.
 	// Configure callbacks and command builders before starting; other APIs do not start input implicitly.
 	static void start();
+	// Pause after any input and command already in progress; never interrupts replxx::input().
+	// Thread-safe and non-blocking, including from the input worker. start() or join() resumes it.
+	static void stop();
 	// Register a worker callback receiving CommandSyntaxException::What(); an empty function clears it.
 	static void set_syntax_exception_callback(const std::function<void(const std::wstring &)> &callback);
 	// Register a worker callback receiving the exception type and message converted to wide strings.
@@ -55,7 +58,7 @@ public:
 	static void set_after_execute_callback(const std::function<void()> &callback);
 	// Register a callback receiving the original and plain text after global log output.
 	static void set_after_log_callback(const std::function<void(const std::wstring &, const std::wstring &)> &callback);
-	// Start the worker and wait until it finishes (e.g. on EOF); return immediately on the worker itself.
+	// Start or resume the worker and wait for EOF or a completed stop; return immediately on the worker itself.
 	static void join();
 	// Print using replxx's printf-style formatting; argument types must match the format.
 	// Does not start the input worker or append a newline. Use "%s" for untrusted text.
